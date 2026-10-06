@@ -1059,6 +1059,7 @@ bool ScreenRecoveryUI::Init(const std::string& locale) {
   // set the callback for hall sensor event
   (void)ev_sync_sw_state([this](auto&& a, auto&& b) { return this->SetSwCallback(a, b);});
 
+  SetTouchGraphicsReady();
   return true;
 }
 

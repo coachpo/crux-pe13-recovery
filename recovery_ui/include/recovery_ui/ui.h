@@ -296,6 +296,7 @@ class RecoveryUI {
   }
 
  protected:
+  void SetTouchGraphicsReady();
   void EnqueueKey(int key_code);
   void EnqueueTouch(const Point& pos);
 
@@ -329,6 +330,7 @@ class RecoveryUI {
   void OnTouchDeviceDetected(int fd);
   void OnKeyDetected(int key_code);
   void CalibrateTouch(int fd);
+  void ReadTouchSlotState(int fd);
   void OnTouchPress();
   void OnTouchTrack();
   void OnTouchRelease();
@@ -380,6 +382,17 @@ class RecoveryUI {
   bool touch_saw_x_;
   bool touch_saw_y_;
   bool touch_reported_;
+  bool touch_protocol_b_;
+  int touch_protocol_b_fd_;
+  bool touch_has_distance_;
+  bool touch_distance_valid_;
+  int touch_raw_distance_;
+  int touch_tracking_id_;
+  bool touch_raw_valid_x_;
+  bool touch_raw_valid_y_;
+  bool touch_sync_dropped_;
+  Point touch_raw_pos_;
+  std::atomic<bool> touch_graphics_ready_{ false };
   Point touch_pos_;
   Point touch_start_;
   Point touch_track_;

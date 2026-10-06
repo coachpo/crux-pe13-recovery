@@ -85,6 +85,15 @@ RecoveryUI::RecoveryUI()
       touch_saw_x_(false),
       touch_saw_y_(false),
       touch_reported_(false),
+      touch_protocol_b_(false),
+      touch_protocol_b_fd_(-1),
+      touch_has_distance_(false),
+      touch_distance_valid_(false),
+      touch_raw_distance_(0),
+      touch_tracking_id_(-1),
+      touch_raw_valid_x_(false),
+      touch_raw_valid_y_(false),
+      touch_sync_dropped_(false),
       is_bootreason_recovery_ui_(false),
       screensaver_state_(ScreensaverState::DISABLED) {
   memset(key_pressed, 0, sizeof(key_pressed));
@@ -99,6 +108,22 @@ RecoveryUI::~RecoveryUI() {
 }
 
 void RecoveryUI::OnTouchDeviceDetected(int fd) {
+  // Slot coordinates are persistent state; a new contact may omit unchanged axes.
+  constexpr size_t bits_per_word = sizeof(unsigned long) * 8;
+  unsigned long abs_bits[(ABS_MAX + 1 + bits_per_word - 1) / bits_per_word] = {};
+  auto has_abs = [&abs_bits](int code) {
+    return (abs_bits[code / bits_per_word] & (1UL << (code % bits_per_word))) != 0;
+  };
+  if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits) >= 0 &&
+      has_abs(ABS_MT_SLOT) && has_abs(ABS_MT_POSITION_X) && has_abs(ABS_MT_POSITION_Y) &&
+      touch_protocol_b_fd_ == -1) {
+    touch_protocol_b_ = true;
+    touch_protocol_b_fd_ = fd;
+    touch_has_distance_ = has_abs(ABS_MT_DISTANCE);
+    CalibrateTouch(fd);
+    ReadTouchSlotState(fd);
+  }
+
   char name[256];
   char path[PATH_MAX];
   char buf[4096];
@@ -261,6 +286,30 @@ void RecoveryUI::CalibrateTouch(int fd) {
   calibrated = true;
 }
 
+void RecoveryUI::ReadTouchSlotState(int fd) {
+  touch_slot_ = -1;
+  input_absinfo slot_info;
+  if (ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &slot_info) == 0) {
+    touch_slot_ = slot_info.value;
+  }
+  int x_state[2] = { ABS_MT_POSITION_X, 0 };
+  int y_state[2] = { ABS_MT_POSITION_Y, 0 };
+  touch_raw_valid_x_ = ioctl(fd, EVIOCGMTSLOTS(sizeof(x_state)), x_state) == 0;
+  touch_raw_valid_y_ = ioctl(fd, EVIOCGMTSLOTS(sizeof(y_state)), y_state) == 0;
+  if (touch_raw_valid_x_) touch_raw_pos_.x(x_state[1]);
+  if (touch_raw_valid_y_) touch_raw_pos_.y(y_state[1]);
+  touch_distance_valid_ = !touch_has_distance_;
+  if (touch_has_distance_) {
+    int distance_state[2] = { ABS_MT_DISTANCE, 0 };
+    touch_distance_valid_ = ioctl(fd, EVIOCGMTSLOTS(sizeof(distance_state)), distance_state) == 0;
+    if (touch_distance_valid_) touch_raw_distance_ = distance_state[1];
+  }
+}
+
+void RecoveryUI::SetTouchGraphicsReady() {
+  touch_graphics_ready_.store(true);
+}
+
 void RecoveryUI::OnTouchPress() {
   touch_start_ = touch_track_ = touch_pos_;
 }
@@ -311,6 +360,13 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
     return -1;
   }
 
+  // SYN and absolute events belong to their own evdev stream. Keyboard frames
+  // must not commit a partial touch frame from the selected slot device.
+  if (touch_protocol_b_ && fd != touch_protocol_b_fd_ &&
+      (ev.type == EV_SYN || ev.type == EV_ABS)) {
+    return 0;
+  }
+
   // Touch inputs handling.
   //
   // Per the doc Multi-touch Protocol at below, there are two protocols.
@@ -328,18 +384,60 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
   // Touch input events will only be available if touch_screen_allowed_ is set.
 
   if (ev.type == EV_SYN) {
-    if (touch_screen_allowed_ && ev.code == SYN_REPORT) {
-      // There might be multiple SYN_REPORT events. Only report press/release once.
-      if (!touch_reported_ && touch_finger_down_) {
-        if (touch_saw_x_ && touch_saw_y_) {
+    if (touch_screen_allowed_ && touch_protocol_b_ && ev.code == SYN_DROPPED) {
+      // Do not turn an incomplete contact into a menu action after stream loss.
+      touch_sync_dropped_ = true;
+      touch_tracking_id_ = -1;
+      touch_finger_down_ = touch_reported_ = false;
+      touch_raw_valid_x_ = touch_raw_valid_y_ = false;
+      touch_saw_x_ = touch_saw_y_ = false;
+    } else if (touch_screen_allowed_ && ev.code == SYN_REPORT) {
+      if (touch_sync_dropped_) {
+        ReadTouchSlotState(fd);
+        touch_sync_dropped_ = false;
+        return 0;
+      }
+      // Base Init starts the input thread before Screen Init creates gr_draw.
+      if (!touch_graphics_ready_.load()) return 0;
+      if (touch_protocol_b_) {
+        touch_finger_down_ = touch_tracking_id_ >= 0 &&
+                (!touch_has_distance_ || (touch_distance_valid_ && touch_raw_distance_ == 0));
+        const bool position_ready = touch_slot_ >= 0 && touch_raw_valid_x_ && touch_raw_valid_y_ &&
+                touch_max_.x() > touch_min_.x() && touch_max_.y() > touch_min_.y();
+        if (position_ready) {
+          // Preserve the existing mapping; paired Crux axes have minimum zero.
+          touch_pos_.x(touch_raw_pos_.x() * gr_fb_width_real() /
+                       (touch_max_.x() - touch_min_.x()));
+          touch_pos_.y(touch_raw_pos_.y() * gr_fb_height_real() /
+                       (touch_max_.y() - touch_min_.y()));
+        }
+        if (!touch_reported_ && touch_finger_down_ && position_ready) {
           OnTouchPress();
           touch_reported_ = true;
+        } else if (touch_reported_ && !touch_finger_down_) {
+          OnTouchRelease();
+          touch_reported_ = false;
+        } else if (touch_reported_ && position_ready && (touch_saw_x_ || touch_saw_y_)) {
+          OnTouchTrack();
+        }
+        touch_saw_x_ = touch_saw_y_ = false;
+      } else {
+        // Keep type A's original fresh-pair lifecycle, including across frames.
+        if (touch_saw_x_) touch_pos_.x(touch_raw_pos_.x() * gr_fb_width_real() /
+                                     (touch_max_.x() - touch_min_.x()));
+        if (touch_saw_y_) touch_pos_.y(touch_raw_pos_.y() * gr_fb_height_real() /
+                                     (touch_max_.y() - touch_min_.y()));
+        if (!touch_reported_ && touch_finger_down_) {
+          if (touch_saw_x_ && touch_saw_y_) {
+            OnTouchPress();
+            touch_reported_ = true;
+            touch_saw_x_ = touch_saw_y_ = false;
+          }
+        } else if (touch_reported_ && !touch_finger_down_) {
+          OnTouchRelease();
+          touch_reported_ = false;
           touch_saw_x_ = touch_saw_y_ = false;
         }
-      } else if (touch_reported_ && !touch_finger_down_) {
-        OnTouchRelease();
-        touch_reported_ = false;
-        touch_saw_x_ = touch_saw_y_ = false;
       }
     }
     return 0;
@@ -368,36 +466,58 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
 
   if (touch_screen_allowed_ && ev.type == EV_ABS) {
     CalibrateTouch(fd);
+    if (touch_sync_dropped_) return 0;
     if (ev.code == ABS_MT_SLOT) {
       touch_slot_ = ev.value;
     }
-    // Ignore other fingers.
-    if (touch_slot_ > 0) return 0;
-
+    // Unknown type B selectors are not implicitly primary slot zero.
+    if (touch_protocol_b_ ? touch_slot_ != 0 : touch_slot_ > 0) return 0;
     switch (ev.code) {
       case ABS_MT_POSITION_X:
-        touch_finger_down_ = true;
-        touch_saw_x_ = true;
-        touch_pos_.x(ev.value * gr_fb_width_real() / (touch_max_.x() - touch_min_.x()));
-        if (touch_reported_ && touch_saw_y_) {
-          OnTouchTrack();
-          touch_saw_x_ = touch_saw_y_ = false;
+        touch_raw_pos_.x(ev.value);
+        touch_saw_x_ = touch_raw_valid_x_ = true;
+        if (!touch_protocol_b_) {
+          touch_finger_down_ = true;
+          if (touch_graphics_ready_.load()) {
+            touch_pos_.x(ev.value * gr_fb_width_real() / (touch_max_.x() - touch_min_.x()));
+            if (touch_reported_ && touch_saw_y_) {
+              OnTouchTrack();
+              touch_saw_x_ = touch_saw_y_ = false;
+            }
+          }
         }
         break;
 
       case ABS_MT_POSITION_Y:
-        touch_finger_down_ = true;
-        touch_saw_y_ = true;
-        touch_pos_.y(ev.value * gr_fb_height_real() / (touch_max_.y() - touch_min_.y()));
-        if (touch_reported_ && touch_saw_x_) {
-          OnTouchTrack();
-          touch_saw_x_ = touch_saw_y_ = false;
+        touch_raw_pos_.y(ev.value);
+        touch_saw_y_ = touch_raw_valid_y_ = true;
+        if (!touch_protocol_b_) {
+          touch_finger_down_ = true;
+          if (touch_graphics_ready_.load()) {
+            touch_pos_.y(ev.value * gr_fb_height_real() / (touch_max_.y() - touch_min_.y()));
+            if (touch_reported_ && touch_saw_x_) {
+              OnTouchTrack();
+              touch_saw_x_ = touch_saw_y_ = false;
+            }
+          }
+        }
+        break;
+
+      case ABS_MT_DISTANCE:
+        if (touch_protocol_b_) {
+          touch_raw_distance_ = ev.value;
+          touch_distance_valid_ = true;
         }
         break;
 
       case ABS_MT_TRACKING_ID:
-        // Protocol B: -1 marks lifting the contact.
-        if (ev.value < 0) touch_finger_down_ = false;
+        if (touch_protocol_b_) {
+          // Replacement cancels the old contact; do not click at its stale position.
+          if (ev.value >= 0 && ev.value != touch_tracking_id_) touch_reported_ = false;
+          touch_tracking_id_ = ev.value;
+        } else if (ev.value < 0) {
+          touch_finger_down_ = false;
+        }
         break;
     }
     return 0;
@@ -408,7 +528,8 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
       if (ev.code == BTN_TOUCH) {
         // A BTN_TOUCH with value 1 indicates the start of contact (protocol A), with 0 means
         // lifting the contact.
-        touch_finger_down_ = (ev.value == 1);
+        // BTN_TOUCH aggregates every slot; it must not activate cached slot zero.
+        if (!touch_protocol_b_) touch_finger_down_ = (ev.value == 1);
       }
 
       // Intentionally ignore BTN_TOUCH and BTN_TOOL_FINGER, which would otherwise trigger

@@ -149,9 +149,11 @@ static void FinishRecovery(RecoveryUI* ui) {
   copy_logs(save_current_log);
 
   // Reset to normal system boot so recovery won't cycle indefinitely.
-  std::string err;
-  if (!clear_bootloader_message(&err)) {
-    LOG(ERROR) << "Failed to clear BCB message: " << err;
+  if (!IsCruxPeRecovery()) {
+    std::string err;
+    if (!clear_bootloader_message(&err)) {
+      LOG(ERROR) << "Failed to clear BCB message: " << err;
+    }
   }
 
   // Remove the command file, so recovery won't repeat indefinitely.
@@ -540,8 +542,12 @@ change_menu:
       case Device::ENTER_RESCUE: {
         save_current_log = true;
 
+        const bool pe_update_navigation =
+            chosen_action == Device::APPLY_UPDATE && IsCruxPeRecovery();
         update_in_progress = true;
-        WriteUpdateInProgress();
+        if (!pe_update_navigation) {
+          WriteUpdateInProgress();
+        }
 
         Device::BuiltinAction reboot_action;
         if (chosen_action == Device::ENTER_RESCUE) {
@@ -557,6 +563,9 @@ change_menu:
         }
         if (status == INSTALL_NONE) {
           update_in_progress = false;
+          if (pe_update_navigation) {
+            break;
+          }
         }
 
         ui->Print("\nInstall completed with status %d.\n", status);
@@ -640,7 +649,7 @@ static bool IsBatteryOk(int* required_battery_level) {
 }
 
 // Set the retry count to |retry_count| in BCB.
-static void set_retry_bootloader_message(int retry_count, const std::vector<std::string>& args) {
+static bool set_retry_bootloader_message(int retry_count, const std::vector<std::string>& args) {
   std::vector<std::string> options;
   for (const auto& arg : args) {
     if (!android::base::StartsWith(arg, "--retry_count")) {
@@ -653,7 +662,9 @@ static void set_retry_bootloader_message(int retry_count, const std::vector<std:
   std::string err;
   if (!update_bootloader_message(options, &err)) {
     LOG(ERROR) << err;
+    return false;
   }
+  return true;
 }
 
 static bool bootreason_in_blocklist() {
@@ -849,12 +860,17 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     } else {
       // It's a fresh update. Initialize the retry_count in the BCB to 1; therefore we can later
       // identify the interrupted update due to unexpected reboots.
+      bool retry_bcb_ready = true;
       if (retry_count == 0) {
-        set_retry_bootloader_message(retry_count + 1, args);
+        retry_bcb_ready = set_retry_bootloader_message(retry_count + 1, args);
       }
 
       bool should_use_fuse = false;
-      if (!SetupPackageMount(update_package, &should_use_fuse)) {
+      if (!retry_bcb_ready && IsCruxPeRecovery()) {
+        ui->ShowText(true);
+        ui->Print("Cannot persist update arguments; staying in recovery.\n");
+        status = INSTALL_ERROR;
+      } else if (!SetupPackageMount(update_package, &should_use_fuse)) {
         LOG(INFO) << "Failed to set up the package access, skipping installation";
         status = INSTALL_ERROR;
       } else if (install_with_fuse || should_use_fuse) {
@@ -883,12 +899,17 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         if (status == INSTALL_RETRY && retry_count < RETRY_LIMIT) {
           copy_logs(save_current_log);
           retry_count += 1;
-          set_retry_bootloader_message(retry_count, args);
-          // Print retry count on screen.
-          ui->Print("Retry attempt %d\n", retry_count);
+          if (!set_retry_bootloader_message(retry_count, args) && IsCruxPeRecovery()) {
+            ui->ShowText(true);
+            ui->Print("Cannot persist update retry; staying in recovery.\n");
+            status = INSTALL_ERROR;
+          } else {
+            // Print retry count on screen.
+            ui->Print("Retry attempt %d\n", retry_count);
 
-          // Reboot back into recovery to retry the update.
-          Reboot("recovery");
+            // Reboot back into recovery to retry the update.
+            Reboot("recovery");
+          }
         }
         // If this is an eng or userdebug build, then automatically
         // turn the text display on if the script fails so the error

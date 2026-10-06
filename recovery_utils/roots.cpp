@@ -130,6 +130,25 @@ Volume* volume_for_mount_point(const std::string& mount_point) {
   return android::fs_mgr::GetEntryForMountPoint(&fstab, mount_point);
 }
 
+bool IsCruxPeRecovery() {
+  if (android::base::GetProperty("ro.product.device", "") != "crux" ||
+      access("/dev/crux-pe-storage-guard.active", F_OK) != 0 ||
+      volume_for_mount_point("/misc") != nullptr || volume_for_mount_point("/cache") != nullptr) {
+    return false;
+  }
+
+  auto is_pe_volume = [](const char* mount_point, const char* partition) {
+    const Volume* volume = volume_for_mount_point(mount_point);
+    return volume != nullptr &&
+           (volume->blk_device == std::string("/dev/block/by-name/") + partition ||
+            volume->blk_device == std::string("/dev/block/bootdevice/by-name/") + partition);
+  };
+
+  // The native guard and loaded PE volumes also identify boots without a suffix.
+  return is_pe_volume("/system", "pesystem") && is_pe_volume("/vendor", "pevendor") &&
+         is_pe_volume("/data", "peuserdata") && is_pe_volume("/metadata", "pemetadata");
+}
+
 // Mount the volume specified by path at the given mount_point.
 int ensure_path_mounted_at(const std::string& path, const std::string& mount_point) {
   return android::fs_mgr::EnsurePathMounted(&fstab, path, mount_point) ? 0 : -1;

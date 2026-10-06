@@ -82,6 +82,7 @@ cc_library_static {
 
     static_libs: [
         "librecovery_ui_default",
+        "librecovery_utils",
     ],
 }
 

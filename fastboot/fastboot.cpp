@@ -29,6 +29,7 @@
 #include <bootloader_message/bootloader_message.h>
 
 #include "recovery_ui/ui.h"
+#include "recovery_utils/roots.h"
 
 static const std::vector<std::pair<std::string, Device::BuiltinAction>> kFastbootMenuActions{
   { "Reboot system now", Device::REBOOT_FROM_FASTBOOT },
@@ -68,9 +69,11 @@ Device::BuiltinAction StartFastboot(Device* device, const std::vector<std::strin
   // TODO(b/112277594) Clear only if 'recovery' field of BCB is empty. If not,
   // set the 'command' field of BCB to 'boot-recovery' so the next boot is into recovery
   // to finish any interrupted tasks.
-  std::string err;
-  if (!clear_bootloader_message(&err)) {
-    LOG(ERROR) << "Failed to clear BCB message: " << err;
+  if (!IsCruxPeRecovery()) {
+    std::string err;
+    if (!clear_bootloader_message(&err)) {
+      LOG(ERROR) << "Failed to clear BCB message: " << err;
+    }
   }
 
   std::vector<std::string> fastboot_menu_items;

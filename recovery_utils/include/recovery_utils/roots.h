@@ -28,6 +28,9 @@ void load_volume_table();
 // Return the Volume* record for this mount point (or nullptr).
 Volume* volume_for_mount_point(const std::string& mount_point);
 
+// Recognizes the Crux PE storage profile in the loaded volume table.
+bool IsCruxPeRecovery();
+
 // Make sure that the volume 'path' is on is mounted.  Returns 0 on
 // success (volume is mounted).
 int ensure_path_mounted(const std::string& path);

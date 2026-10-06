@@ -103,9 +103,10 @@ static void UiLogger(android::base::LogId log_buffer_id, android::base::LogSever
 static std::vector<std::string> get_args(const int argc, char** const argv, std::string* stage) {
   CHECK_GT(argc, 0);
 
+  const bool crux_pe_recovery = IsCruxPeRecovery();
   bootloader_message boot = {};
   std::string err;
-  if (!read_bootloader_message(&boot, &err)) {
+  if (!crux_pe_recovery && !read_bootloader_message(&boot, &err)) {
     LOG(ERROR) << err;
     // If fails, leave a zeroed bootloader_message.
     boot = {};
@@ -167,7 +168,8 @@ static std::vector<std::string> get_args(const int argc, char** const argv, std:
   // bootloader control block. So the device will always boot into recovery to
   // finish the pending work, until FinishRecovery() is called.
   std::vector<std::string> options(args.cbegin() + 1, args.cend());
-  if (!update_bootloader_message(options, &err)) {
+  // A plain U-Boot menu launch has no recovery command to persist in shared BCB.
+  if ((!crux_pe_recovery || !options.empty()) && !update_bootloader_message(options, &err)) {
     LOG(ERROR) << "Failed to set BCB message: " << err;
   }
 

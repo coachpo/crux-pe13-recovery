@@ -27,7 +27,6 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <functional>
@@ -699,55 +698,6 @@ static void log_failure_code(ErrorCode code, const std::string& update_package) 
   LOG(INFO) << log_content;
 }
 
-// crux-install/1: the Recovery container U-Boot starts PE Recovery with the ID
-// of a pending Crux Dev OTA (androidboot.crux_ota_txn). Run its installer,
-// show its progress, and return to U-Boot, which lands the staged ROM FIT or,
-// after a refusal, starts the unchanged ROM. No BCB or shared misc is used.
-static Device::BuiltinAction RunCruxOta(Device* device, const std::string& txn) {
-  auto ui = device->GetUI();
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
-  ui->ShowText(true);
-  ui->Print("Crux PE update, transaction %s\n", txn.c_str());
-  if (ensure_path_mounted("/metadata") != 0) {
-    ui->Print("Cannot mount /metadata; returning to U-Boot.\n");
-    sleep(3);
-    return Device::REBOOT_RECOVERY;
-  }
-  int pipe_fd[2];
-  if (pipe(pipe_fd) != 0) {
-    ui->Print("Cannot start the Crux installer; returning to U-Boot.\n");
-    sleep(3);
-    return Device::REBOOT_RECOVERY;
-  }
-  pid_t pid = fork();
-  if (pid == 0) {
-    dup2(pipe_fd[1], STDOUT_FILENO);
-    dup2(pipe_fd[1], STDERR_FILENO);
-    close(pipe_fd[0]);
-    execl("/system/bin/crux-installer", "crux-installer", "--a-recovery", txn.c_str(), nullptr);
-    _exit(127);
-  }
-  close(pipe_fd[1]);
-  int status = -1;
-  if (pid > 0) {
-    FILE* output = fdopen(pipe_fd[0], "r");
-    char line[512];
-    while (output != nullptr && fgets(line, sizeof(line), output) != nullptr) {
-      ui->Print("%s", line);
-      LOG(INFO) << line;
-    }
-    if (output != nullptr) fclose(output);
-    waitpid(pid, &status, 0);
-  } else {
-    close(pipe_fd[0]);
-  }
-  int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  ui->Print("\nCrux installer exited with status %d; returning to U-Boot.\n", code);
-  ensure_path_unmounted("/metadata");
-  sleep(3);
-  return Device::REBOOT_RECOVERY;
-}
-
 Device::BuiltinAction start_recovery(Device* device, const std::vector<std::string>& args) {
   static constexpr struct option OPTIONS[] = {
     { "fastboot", no_argument, nullptr, 0 },
@@ -885,11 +835,6 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
 
   property_list(print_property, nullptr);
   printf("\n");
-
-  if (std::string crux_txn = android::base::GetProperty("ro.boot.crux_ota_txn", "");
-      !crux_txn.empty() && IsCruxPeRecovery()) {
-    return RunCruxOta(device, crux_txn);
-  }
 
   InstallResult status = INSTALL_SUCCESS;
   // next_action indicates the next target to reboot into upon finishing the install. It could be
